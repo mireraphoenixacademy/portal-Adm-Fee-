@@ -10,7 +10,7 @@ app.use(express.json());
 // Debug: Log environment variables to ensure they're loaded
 console.log('MONGODB_URI:', process.env.MONGODB_URI);
 if (!process.env.MONGODB_URI) {
-    console.error('Error: MONGODB_URI is not defined in .env file');
+    console.error('Error: MONGODB_URI is not defined in environment variables');
     process.exit(1);
 }
 
@@ -93,6 +93,11 @@ const learnerArchiveSchema = new mongoose.Schema({
     learners: [learnerSchema]
 });
 
+const optOutSchema = new mongoose.Schema({
+    phone: String,
+    optedOutAt: { type: Date, default: Date.now }
+});
+
 const Learner = mongoose.model('Learner', learnerSchema);
 const Fee = mongoose.model('Fee', feeSchema);
 const Book = mongoose.model('Book', bookSchema);
@@ -100,6 +105,7 @@ const ClassBook = mongoose.model('ClassBook', classBookSchema);
 const FeeStructure = mongoose.model('FeeStructure', feeStructureSchema);
 const TermSettings = mongoose.model('TermSettings', termSettingsSchema);
 const LearnerArchive = mongoose.model('LearnerArchive', learnerArchiveSchema);
+const OptOut = mongoose.model('OptOut', optOutSchema);
 
 // Routes
 app.get('/api/learners', async (req, res) => {
@@ -247,6 +253,13 @@ app.post('/api/newAcademicYear', async (req, res) => {
     res.json({ message: 'New academic year started' });
 });
 
+// Check if a phone number has opted out
+app.post('/api/checkOptOut', async (req, res) => {
+    const { phone } = req.body;
+    const optedOut = await OptOut.findOne({ phone });
+    res.json(!!optedOut);
+});
+
 // Send Notification Endpoint
 app.post('/api/sendNotification', async (req, res) => {
     const { phone, email, message } = req.body;
@@ -286,7 +299,54 @@ app.post('/api/sendNotification', async (req, res) => {
     }
 });
 
+// Handle incoming messages from Twilio
+app.post('/incoming-message', async (req, res) => {
+    const { From, To, Body, MessageSid } = req.body;
+    console.log('Received incoming message:', { From, To, Body, MessageSid });
+
+    try {
+        // Handle opt-out requests
+        if (Body.trim().toUpperCase() === 'STOP') {
+            console.log(`User ${From} has opted out.`);
+            await OptOut.create({ phone: From });
+        } else if (Body.trim().toUpperCase() === 'START') {
+            console.log(`User ${From} has opted back in.`);
+            await OptOut.deleteOne({ phone: From });
+        } else if (Body.trim().toLowerCase().includes('how much')) {
+            // Look up the parent's learner and fee balance
+            const learner = await Learner.findOne({ parentPhone: From });
+            if (learner) {
+                const fee = await Fee.findOne({ admissionNo: learner.admissionNo });
+                const responseMessage = fee
+                    ? `Your child ${learner.fullName} has a fee balance of ${fee.balance} for ${fee.term}.`
+                    : `No fee records found for ${learner.fullName}.`;
+                await twilioClient.messages.create({
+                    body: responseMessage,
+                    from: To,
+                    to: From
+                });
+                console.log(`Sent response to ${From}: ${responseMessage}`);
+            }
+        } else {
+            console.log(`Received message from ${From}: ${Body}`);
+            // Optionally, respond with a default message
+            await twilioClient.messages.create({
+                body: 'Thank you for your message. Reply "HOW MUCH" to check your fee balance, or "STOP" to opt out.',
+                from: To,
+                to: From
+            });
+        }
+
+        // Respond to Twilio with a 200 status to acknowledge receipt
+        res.status(200).send('Message received');
+    } catch (err) {
+        console.error('Error handling incoming message:', err.message);
+        res.status(500).send('Error processing message');
+    }
+});
+
 app.use(express.static('public'));
 
+// Use Render's dynamic port
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
